@@ -1,3 +1,11 @@
+"""
+MEXC ULTIMATE MULTI-TIMEFRAME SCANNER (FIXED)
+- Scans ALL MEXC coins (up to 100+)
+- Multi-timeframe analysis
+- Position sizing with leverage
+- Fixed f-string errors
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -94,7 +102,8 @@ class MEXCDataFetcher:
     def __init__(self):
         self.exchange = ccxt.mexc({
             'enableRateLimit': True,
-            'timeout': 30000
+            'timeout': 30000,
+            'rateLimit': 1200
         })
         self.timeframes = {
             '15m': '15m',
@@ -105,13 +114,15 @@ class MEXCDataFetcher:
             '1M': '1M'
         }
     
-    def get_all_symbols(self, limit=50):
+    def get_all_symbols(self):
+        """Fetch ALL active USDT pairs from MEXC"""
         try:
             markets = self.exchange.load_markets()
             symbols = [s for s in markets if '/USDT' in s and markets[s]['active']]
-            return symbols[:limit]
-        except:
-            return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+            return symbols
+        except Exception as e:
+            st.error(f"Error loading symbols: {e}")
+            return []
     
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 200):
         """Fetch OHLCV for a given symbol and timeframe"""
@@ -129,7 +140,7 @@ class MEXCDataFetcher:
         data = {}
         for tf in timeframes:
             df = self.fetch_ohlcv(symbol, tf, limit=200)
-            if df is not None:
+            if df is not None and len(df) >= 50:  # Ensure enough data
                 data[tf] = df
         return data
 
@@ -317,6 +328,8 @@ class MultiTimeframeAnalyzer:
         entry_tf = '15m'
         if entry_tf not in data:
             entry_tf = '1h'  # fallback
+        if entry_tf not in data:
+            return {}
         
         df_entry = data.get(entry_tf)
         if df_entry is None or len(df_entry) < 20:
@@ -399,30 +412,34 @@ class Scanner:
     
     def scan(self, symbols: List[str], filters: Dict) -> List[Dict]:
         results = []
+        total = len(symbols)
         progress_bar = st.progress(0)
         status = st.empty()
+        start_time = time.time()
         
         for i, symbol in enumerate(symbols):
-            status.text(f"Scanning {i+1}/{len(symbols)}: {symbol}")
+            elapsed = time.time() - start_time
+            est_remaining = (elapsed/(i+1))*(total-i-1) if i>0 else 0
+            status.text(f"Scanning {i+1}/{total}: {symbol} | Elapsed: {elapsed:.0f}s | Est remaining: {est_remaining:.0f}s")
             
             # Fetch multi-timeframe data
             data = self.fetcher.get_multi_timeframe_data(symbol, self.analyzer.timeframes)
             if not data:
-                progress_bar.progress((i+1)/len(symbols))
+                progress_bar.progress((i+1)/total)
                 continue
             
             # Analyze
             signal = self.analyzer.analyze(symbol, data)
             if not signal:
-                progress_bar.progress((i+1)/len(symbols))
+                progress_bar.progress((i+1)/total)
                 continue
             
             # Apply filters
             if filters.get('near_support_only') and not signal.get('near_support'):
-                progress_bar.progress((i+1)/len(symbols))
+                progress_bar.progress((i+1)/total)
                 continue
             if filters.get('near_resistance_only') and not signal.get('near_resistance'):
-                progress_bar.progress((i+1)/len(symbols))
+                progress_bar.progress((i+1)/total)
                 continue
             if filters.get('high_movers_only'):
                 # Need to check high mover on any timeframe
@@ -432,13 +449,13 @@ class Scanner:
                         is_mover = True
                         break
                 if not is_mover:
-                    progress_bar.progress((i+1)/len(symbols))
+                    progress_bar.progress((i+1)/total)
                     continue
             
             results.append(signal)
-            progress_bar.progress((i+1)/len(symbols))
+            progress_bar.progress((i+1)/total)
         
-        status.text("")
+        status.text(f"Scan completed in {time.time()-start_time:.1f}s")
         progress_bar.empty()
         return results
 
@@ -498,7 +515,7 @@ with st.sidebar:
     st.divider()
     
     # Scan button
-    if st.button("🚀 START SCAN", use_container_width=True, type="primary"):
+    if st.button("🚀 START SCAN (ALL COINS)", use_container_width=True, type="primary"):
         st.session_state.scanning = True
     
     # Manual refresh
@@ -507,14 +524,22 @@ with st.sidebar:
     
     # Auto-refresh toggle
     auto_refresh = st.checkbox("Auto-refresh every 30s", value=False)
+    
+    st.divider()
+    st.caption("Note: Scanning all MEXC coins may take 2-5 minutes. Please be patient.")
 
 # Main area
 if st.session_state.scanning:
-    symbols = st.session_state.fetcher.get_all_symbols(limit=30)  # Limit for performance
-    with st.spinner("Scanning markets... this may take a minute"):
-        results = st.session_state.scanner.scan(symbols, filters)
-        st.session_state.scan_results = results
+    symbols = st.session_state.fetcher.get_all_symbols()
+    if not symbols:
+        st.error("Failed to fetch symbols. Please try again.")
         st.session_state.scanning = False
+    else:
+        st.info(f"Found {len(symbols)} coins. Starting scan... This may take several minutes.")
+        with st.spinner("Scanning..."):
+            results = st.session_state.scanner.scan(symbols, filters)
+            st.session_state.scan_results = results
+            st.session_state.scanning = False
 
 # Display results
 if st.session_state.scan_results:
@@ -537,15 +562,20 @@ if st.session_state.scan_results:
         if long_signals:
             for sig in long_signals:
                 # Calculate position
+                if sig['atr'] and not np.isnan(sig['atr']):
+                    stop_price = sig['price'] - 2 * sig['atr']
+                else:
+                    stop_price = sig['price'] * 0.98
                 pos = PositionSizer.calculate(
-                    account_balance, risk_percent, sig['price'],
-                    sig['price'] - 2 * sig['atr'] if sig['atr'] else sig['price'] * 0.98,
-                    leverage
+                    account_balance, risk_percent, sig['price'], stop_price, leverage
                 )
                 with st.container():
-                    card_class = "long-card"
+                    # Format support/resistance strings safely
+                    near_support_str = f"${sig['near_support']:.4f}" if sig['near_support'] else "N/A"
+                    near_resistance_str = f"${sig['near_resistance']:.4f}" if sig['near_resistance'] else "N/A"
+                    
                     st.markdown(f"""
-                    <div class='signal-card {card_class}'>
+                    <div class='signal-card long-card'>
                         <div style='display: flex; justify-content: space-between;'>
                             <h2>{sig['symbol']}</h2>
                             <span class='timeframe-badge'>Entry TF: {sig['entry_tf']}</span>
@@ -559,14 +589,16 @@ if st.session_state.scan_results:
                             <div class='metric-box'>ATR: ${sig['atr']:.4f}</div>
                             <div class='metric-box'>Trend: {sig['trendline']}</div>
                         </div>
-                        <p><strong>Near support:</strong> ${sig['near_support']:.4f if sig['near_support'] else 'N/A'} | <strong>Near resistance:</strong> ${sig['near_resistance']:.4f if sig['near_resistance'] else 'N/A'}</p>
+                        <p><strong>Near support:</strong> {near_support_str} | <strong>Near resistance:</strong> {near_resistance_str}</p>
                     """, unsafe_allow_html=True)
                     
                     if pos:
+                        target1 = sig['price'] + 3 * sig['atr'] if sig['atr'] else sig['price'] * 1.03
+                        target2 = sig['price'] + 5 * sig['atr'] if sig['atr'] else sig['price'] * 1.05
                         st.markdown(f"""
                         <div style='background: #2d2d2d; padding: 10px; border-radius: 8px; margin-top: 10px;'>
                             <h4>Position Plan</h4>
-                            <p>Entry: ${sig['price']:.4f} | Stop: ${sig['price'] - 2*sig['atr']:.4f} | Target 1: ${sig['price'] + 3*sig['atr']:.4f} | Target 2: ${sig['price'] + 5*sig['atr']:.4f}</p>
+                            <p>Entry: ${sig['price']:.4f} | Stop: ${stop_price:.4f} | Target 1: ${target1:.4f} | Target 2: ${target2:.4f}</p>
                             <p>Position size: {pos['position_size']:.4f} units | Value: ${pos['position_value']:.2f} | Margin: ${pos['required_margin']:.2f}</p>
                             <p>Risk: ${pos['risk_amount']:.2f} ({risk_percent}%)</p>
                         </div>
@@ -579,15 +611,19 @@ if st.session_state.scan_results:
     with tab_short:
         if short_signals:
             for sig in short_signals:
+                if sig['atr'] and not np.isnan(sig['atr']):
+                    stop_price = sig['price'] + 2 * sig['atr']
+                else:
+                    stop_price = sig['price'] * 1.02
                 pos = PositionSizer.calculate(
-                    account_balance, risk_percent, sig['price'],
-                    sig['price'] + 2 * sig['atr'] if sig['atr'] else sig['price'] * 1.02,
-                    leverage
+                    account_balance, risk_percent, sig['price'], stop_price, leverage
                 )
                 with st.container():
-                    card_class = "short-card"
+                    near_support_str = f"${sig['near_support']:.4f}" if sig['near_support'] else "N/A"
+                    near_resistance_str = f"${sig['near_resistance']:.4f}" if sig['near_resistance'] else "N/A"
+                    
                     st.markdown(f"""
-                    <div class='signal-card {card_class}'>
+                    <div class='signal-card short-card'>
                         <div style='display: flex; justify-content: space-between;'>
                             <h2>{sig['symbol']}</h2>
                             <span class='timeframe-badge'>Entry TF: {sig['entry_tf']}</span>
@@ -601,14 +637,16 @@ if st.session_state.scan_results:
                             <div class='metric-box'>ATR: ${sig['atr']:.4f}</div>
                             <div class='metric-box'>Trend: {sig['trendline']}</div>
                         </div>
-                        <p><strong>Near support:</strong> ${sig['near_support']:.4f if sig['near_support'] else 'N/A'} | <strong>Near resistance:</strong> ${sig['near_resistance']:.4f if sig['near_resistance'] else 'N/A'}</p>
+                        <p><strong>Near support:</strong> {near_support_str} | <strong>Near resistance:</strong> {near_resistance_str}</p>
                     """, unsafe_allow_html=True)
                     
                     if pos:
+                        target1 = sig['price'] - 3 * sig['atr'] if sig['atr'] else sig['price'] * 0.97
+                        target2 = sig['price'] - 5 * sig['atr'] if sig['atr'] else sig['price'] * 0.95
                         st.markdown(f"""
                         <div style='background: #2d2d2d; padding: 10px; border-radius: 8px; margin-top: 10px;'>
                             <h4>Position Plan</h4>
-                            <p>Entry: ${sig['price']:.4f} | Stop: ${sig['price'] + 2*sig['atr']:.4f} | Target 1: ${sig['price'] - 3*sig['atr']:.4f} | Target 2: ${sig['price'] - 5*sig['atr']:.4f}</p>
+                            <p>Entry: ${sig['price']:.4f} | Stop: ${stop_price:.4f} | Target 1: ${target1:.4f} | Target 2: ${target2:.4f}</p>
                             <p>Position size: {pos['position_size']:.4f} units | Value: ${pos['position_value']:.2f} | Margin: ${pos['required_margin']:.2f}</p>
                             <p>Risk: ${pos['risk_amount']:.2f} ({risk_percent}%)</p>
                         </div>
@@ -619,11 +657,14 @@ if st.session_state.scan_results:
             st.info("No short signals found")
 
 else:
-    st.info("👈 Configure filters and click START SCAN to begin")
+    st.info("👈 Configure filters and click START SCAN to begin scanning all MEXC coins")
 
 # Footer
 st.divider()
-st.caption(f"🔄 Last scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Scanning {len(st.session_state.fetcher.get_all_symbols(limit=30))} coins")
+if st.session_state.scan_results:
+    st.caption(f"🔄 Last scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Total signals: {len(st.session_state.scan_results)}")
+else:
+    st.caption(f"🔄 Ready to scan | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # Auto-refresh logic
 if auto_refresh:
